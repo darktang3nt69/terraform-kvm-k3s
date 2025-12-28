@@ -1,16 +1,17 @@
-# Example tfvars - DO NOT COMMIT SECRETS
-# Copy this to terraform.tfvars and customize
-
-# Use local libvirt
+# Libvirt Connection
 libvirt_uri = "qemu:///system"
 
-# Use Ubuntu 22.04 Cloud Image (example)
-base_image_url = "https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img"
+# VM Spec (Locked Values)
+vm_name      = "k3s-worker-1"
+memory_mb    = 4096
+vcpu_count   = 2
+disk_size_gb = 30
 
-# Worker nodes config
-node_count      = 2
-memory_per_node = 2048  # 2GB
-vcpu_per_node   = 2
+# Image
+base_image_url = "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-genericcloud-amd64.qcow2"
 
-# SSH Key (Replace with your actual public key)
-ssh_public_key = "ssh-ed25519 AAAA..."
+# Network
+bridge_interface = "br0"
+
+# SSH Key (Update this path to your real key)
+ssh_public_key_path = "~/.ssh/id_rsa.pub"

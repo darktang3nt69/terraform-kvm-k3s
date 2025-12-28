@@ -1,88 +1,113 @@
-# Main Terraform Configuration for Local Homelab
-# ===============================================
+provider "libvirt" {
+  uri = var.libvirt_uri
+}
 
-# NOTE: This is currently a SKELETON file. 
-# Actual resource logic will be implemented in future steps.
+locals {
+  ssh_pubkey      = trimspace(file(var.ssh_public_key_path))
+  disk_size_bytes = var.disk_size_gb * 1024 * 1024 * 1024
+  wait_for_lease  = var.network_mode == "nat"
+}
 
-# -------------------------------------------------------------
-# 1. Network Configuration
-# -------------------------------------------------------------
-# We will define a libvirt network here.
-# For now, we assume bridged networking or use the functional default 'default' network.
+# 1. Base Image: Use a dedicated name to avoid collisions
+resource "libvirt_volume" "base_image" {
+  name = "debian-12-base-template.qcow2"
+  pool = var.pool_name
+  
+  create = {
+    content = {
+      url = var.base_image_url
+    }
+  }
+  
+  target = {
+    format = {
+      type = "qcow2"
+    }
+  }
+}
 
-# resource "libvirt_network" "k3s_net" {
-#   name = "k3s_net"
-#   ...
-# }
+# 2. VM Disk: Layered on top of the base image
+resource "libvirt_volume" "vm_disk" {
+  name = "${var.vm_name}-disk.qcow2"
+  pool = var.pool_name
+  
+  backing_store = {
+    path = libvirt_volume.base_image.id
+  }
+  
+  capacity = local.disk_size_bytes
+  
+  target = {
+    format = {
+      type = "qcow2"
+    }
+  }
+}
 
+# 3. Cloud-Init
+resource "libvirt_cloudinit_disk" "cloudinit" {
+  name = "${var.vm_name}-cloudinit.iso"
+  # pool argument unsupported in 0.9.1 validation for cloudinit usually, relying on default or implicit
+  
+  user_data = templatefile("${path.module}/cloud_init.cfg", {
+    vm_name        = var.vm_name
+    vm_user        = var.vm_user
+    hostname       = var.vm_name
+    ssh_public_key = local.ssh_pubkey
+  })
+  
+  meta_data = ""
+}
 
-# -------------------------------------------------------------
-# 2. Storage Pool
-# -------------------------------------------------------------
-# Define where VM disk images are stored on the host.
+# 4. The Domain (VM)
+resource "libvirt_domain" "vm" {
+  name   = var.vm_name
+  type   = "kvm"
+  memory = var.memory_mb
+  vcpu   = var.vcpu_count
 
-# resource "libvirt_pool" "cluster_pool" {
-#   name = "k3s_pool"
-#   type = "dir"
-#   path = "/var/lib/libvirt/images/k3s-cluster"
-# }
+  cpu = {
+    mode = "host-passthrough"
+  }
 
+  os = {
+    type = "hvm"
+  }
 
-# -------------------------------------------------------------
-# 3. Base OS Image
-# -------------------------------------------------------------
-# We will check only one Base Volume (e.g. from a cloud image)
+  devices = {
+    disk = [
+      {
+        volume_id = libvirt_volume.vm_disk.id
+      },
+      {
+        volume_id = libvirt_cloudinit_disk.cloudinit.id
+        target = {
+            dev = "sda"
+        }
+      }
+    ]
 
-# resource "libvirt_volume" "os_image" {
-#   name   = "ubuntu-base.qcow2"
-#   pool   = libvirt_pool.cluster_pool.name
-#   source = var.base_image_url
-#   format = "qcow2"
-# }
+    interface = [
+      {
+        network_name   = var.network_mode == "nat" ? var.libvirt_network_name : null
+        bridge         = var.network_mode == "bridge" ? var.bridge_interface : null
+        wait_for_lease = local.wait_for_lease
+      }
+    ]
 
+    console = [
+      {
+        type        = "pty"
+        target_type = "serial"
+        target_port = "0"
+      }
+    ]
+  }
+}
 
-# -------------------------------------------------------------
-# 4. Cloud-Init Configuration
-# -------------------------------------------------------------
-# To bootstrap keys and hostname.
+# Data source to fetch IP addresses
+data "libvirt_domain_interface_addresses" "vm" {
+  domain = libvirt_domain.vm.id
+  source = "lease"
 
-# data "template_file" "user_data" {
-#   template = file("${path.module}/cloud_init.cfg")
-# }
-
-# resource "libvirt_cloudinit_disk" "commoninit" {
-#   name      = "commoninit.iso"
-#   user_data = data.template_file.user_data.rendered
-#   pool      = libvirt_pool.cluster_pool.name
-# }
-
-
-# -------------------------------------------------------------
-# 5. Virtual Machines (K3s Worker Nodes)
-# -------------------------------------------------------------
-# Iterate over a variable map to create multiple VMs
-
-# resource "libvirt_domain" "k3s_node" {
-#   count = var.node_count
-#   
-#   name   = "k3s-worker-${count.index}"
-#   memory = var.memory_per_node
-#   vcpu   = var.vcpu_per_node
-#   
-#   network_interface {
-#     network_name = "default" 
-#     # bridge = "br0" # Future bridged setup
-#   }
-#
-#   disk {
-#     volume_id = libvirt_volume.node_disk[count.index].id
-#   }
-#   
-#   cloudinit = libvirt_cloudinit_disk.commoninit.id
-#
-#   console {
-#     type        = "pty"
-#     target_port = "0"
-#     target_type = "serial"
-#   }
-# }
+}
