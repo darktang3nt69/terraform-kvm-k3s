@@ -3,111 +3,118 @@ provider "libvirt" {
 }
 
 locals {
-  ssh_pubkey      = trimspace(file(var.ssh_public_key_path))
-  disk_size_bytes = var.disk_size_gb * 1024 * 1024 * 1024
-  wait_for_lease  = var.network_mode == "nat"
+  ssh_pubkey = trimspace(file(var.ssh_public_key_path))
+
+  password_lines = var.enable_console_password ? [
+    "ssh_pwauth: true",
+    "chpasswd:",
+    "  expire: false",
+    "  users:",
+    "    - name: ${var.vm_user}",
+    "      password: ${var.vm_password}",
+  ] : []
+
+  password_yaml = join("\n", local.password_lines)
 }
 
-# 1. Base Image: Use a dedicated name to avoid collisions
-resource "libvirt_volume" "base_image" {
-  name = "debian-12-base-template.qcow2"
-  pool = var.pool_name
-  
-  create = {
-    content = {
-      url = var.base_image_url
-    }
-  }
-  
-  target = {
-    format = {
-      type = "qcow2"
-    }
-  }
-}
-
-# 2. VM Disk: Layered on top of the base image
+# VM disk downloaded directly (NO backing file)
 resource "libvirt_volume" "vm_disk" {
-  name = "${var.vm_name}-disk.qcow2"
-  pool = var.pool_name
-  
-  backing_store = {
-    path = libvirt_volume.base_image.id
+  name   = "${var.vm_name}.qcow2"
+  pool   = var.pool_name
+  source = var.base_image_url
+  format = "qcow2"
+}
+
+# Resize disk after download (qemu-img resize)
+resource "null_resource" "resize_disk" {
+  triggers = {
+    disk_file = libvirt_volume.vm_disk.id  # in your provider version, id is the file path
+    size_gb   = tostring(var.disk_size_gb)
   }
-  
-  capacity = local.disk_size_bytes
-  
-  target = {
-    format = {
-      type = "qcow2"
-    }
+
+  provisioner "local-exec" {
+    command = <<-EOT
+      set -e
+      echo "Resizing disk: ${libvirt_volume.vm_disk.id} -> ${var.disk_size_gb}G"
+      sudo qemu-img resize "${libvirt_volume.vm_disk.id}" ${var.disk_size_gb}G
+
+      # Ensure qemu can read it (homelab mode)
+      sudo chmod 0755 /var/lib/libvirt /var/lib/libvirt/images || true
+      sudo setfacl -b "${libvirt_volume.vm_disk.id}" 2>/dev/null || true
+      sudo chown root:root "${libvirt_volume.vm_disk.id}" || true
+      sudo chmod 0644 "${libvirt_volume.vm_disk.id}" || true
+
+      sudo ls -l "${libvirt_volume.vm_disk.id}" || true
+    EOT
   }
 }
 
-# 3. Cloud-Init
 resource "libvirt_cloudinit_disk" "cloudinit" {
   name = "${var.vm_name}-cloudinit.iso"
-  # pool argument unsupported in 0.9.1 validation for cloudinit usually, relying on default or implicit
-  
-  user_data = templatefile("${path.module}/cloud_init.cfg", {
-    vm_name        = var.vm_name
-    vm_user        = var.vm_user
-    hostname       = var.vm_name
-    ssh_public_key = local.ssh_pubkey
-  })
-  
-  meta_data = ""
+  pool = var.pool_name
+
+  user_data = <<-EOF
+    #cloud-config
+    hostname: ${var.vm_name}
+    manage_etc_hosts: true
+
+    users:
+      - name: ${var.vm_user}
+        sudo: ALL=(ALL) NOPASSWD:ALL
+        groups: users, admin
+        home: /home/${var.vm_user}
+        shell: /bin/bash
+        ssh-authorized-keys:
+          - ${local.ssh_pubkey}
+
+    ${local.password_yaml}
+
+    package_update: false
+    package_upgrade: false
+
+    packages:
+      - qemu-guest-agent
+      - curl
+
+    runcmd:
+      - systemctl enable --now qemu-guest-agent
+      - echo "cloud-init done" > /var/log/cloud-init-done.txt
+  EOF
+
+  meta_data = <<-EOF
+    instance-id: ${var.vm_name}
+    local-hostname: ${var.vm_name}
+  EOF
 }
 
-# 4. The Domain (VM)
 resource "libvirt_domain" "vm" {
+  depends_on = [null_resource.resize_disk]
+
   name   = var.vm_name
   type   = "kvm"
   memory = var.memory_mb
   vcpu   = var.vcpu_count
 
-  cpu = {
-    mode = "host-passthrough"
+  cloudinit = libvirt_cloudinit_disk.cloudinit.id
+
+  disk {
+    volume_id = libvirt_volume.vm_disk.id
   }
 
-  os = {
-    type = "hvm"
+  # Keep NIC, but DO NOT wait for DHCP lease (prevents terraform timeout)
+  network_interface {
+    network_name   = var.libvirt_network_name
+    wait_for_lease = false
   }
 
-  devices = {
-    disk = [
-      {
-        volume_id = libvirt_volume.vm_disk.id
-      },
-      {
-        volume_id = libvirt_cloudinit_disk.cloudinit.id
-        target = {
-            dev = "sda"
-        }
-      }
-    ]
-
-    interface = [
-      {
-        network_name   = var.network_mode == "nat" ? var.libvirt_network_name : null
-        bridge         = var.network_mode == "bridge" ? var.bridge_interface : null
-        wait_for_lease = local.wait_for_lease
-      }
-    ]
-
-    console = [
-      {
-        type        = "pty"
-        target_type = "serial"
-        target_port = "0"
-      }
-    ]
+  console {
+    type        = "pty"
+    target_type = "serial"
+    target_port = "0"
   }
-}
 
-# Data source to fetch IP addresses
-data "libvirt_domain_interface_addresses" "vm" {
-  domain = libvirt_domain.vm.id
-  source = "lease"
-
+  graphics {
+    type        = "spice"
+    listen_type = "none"
+  }
 }
