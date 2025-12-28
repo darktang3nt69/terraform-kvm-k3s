@@ -19,7 +19,8 @@ locals {
 
 # VM disk downloaded directly (NO backing file)
 resource "libvirt_volume" "vm_disk" {
-  name   = "${var.vm_name}.qcow2"
+  count  = var.vm_count
+  name   = "${var.vm_name}-${count.index}.qcow2"
   pool   = var.pool_name
   source = var.base_image_url
   format = "qcow2"
@@ -27,78 +28,66 @@ resource "libvirt_volume" "vm_disk" {
 
 # Resize disk after download (qemu-img resize)
 resource "null_resource" "resize_disk" {
+  count = var.vm_count
   triggers = {
-    disk_file = libvirt_volume.vm_disk.id  # in your provider version, id is the file path
+    disk_file = libvirt_volume.vm_disk[count.index].id
     size_gb   = tostring(var.disk_size_gb)
   }
 
   provisioner "local-exec" {
     command = <<-EOT
       set -e
-      echo "Resizing disk: ${libvirt_volume.vm_disk.id} -> ${var.disk_size_gb}G"
-      sudo qemu-img resize "${libvirt_volume.vm_disk.id}" ${var.disk_size_gb}G
+      echo "Resizing disk: ${libvirt_volume.vm_disk[count.index].id} -> ${var.disk_size_gb}G"
+      sudo qemu-img resize "${libvirt_volume.vm_disk[count.index].id}" ${var.disk_size_gb}G
 
       # Ensure qemu can read it (homelab mode)
       sudo chmod 0755 /var/lib/libvirt /var/lib/libvirt/images || true
-      sudo setfacl -b "${libvirt_volume.vm_disk.id}" 2>/dev/null || true
-      sudo chown root:root "${libvirt_volume.vm_disk.id}" || true
-      sudo chmod 0644 "${libvirt_volume.vm_disk.id}" || true
+      sudo setfacl -b "${libvirt_volume.vm_disk[count.index].id}" 2>/dev/null || true
+      sudo chown root:root "${libvirt_volume.vm_disk[count.index].id}" || true
+      sudo chmod 0644 "${libvirt_volume.vm_disk[count.index].id}" || true
 
-      sudo ls -l "${libvirt_volume.vm_disk.id}" || true
+      sudo ls -l "${libvirt_volume.vm_disk[count.index].id}" || true
     EOT
   }
 }
 
 resource "libvirt_cloudinit_disk" "cloudinit" {
-  name = "${var.vm_name}-cloudinit.iso"
-  pool = var.pool_name
+  count = var.vm_count
+  name  = "${var.vm_name}-${count.index}-cloudinit.iso"
+  pool  = var.pool_name
 
-  user_data = <<-EOF
-    #cloud-config
-    hostname: ${var.vm_name}
-    manage_etc_hosts: true
+  user_data = templatefile("${path.module}/cloud_init.cfg", {
+    hostname       = "${var.vm_name}-${count.index}"
+    vm_user        = var.vm_user
+    ssh_public_key = local.ssh_pubkey
+    password_yaml  = local.password_yaml
+  })
 
-    users:
-      - name: ${var.vm_user}
-        sudo: ALL=(ALL) NOPASSWD:ALL
-        groups: users, admin
-        home: /home/${var.vm_user}
-        shell: /bin/bash
-        ssh-authorized-keys:
-          - ${local.ssh_pubkey}
-
-    ${local.password_yaml}
-
-    package_update: false
-    package_upgrade: false
-
-    packages:
-      - qemu-guest-agent
-      - curl
-
-    runcmd:
-      - systemctl enable --now qemu-guest-agent
-      - echo "cloud-init done" > /var/log/cloud-init-done.txt
-  EOF
+  network_config = templatefile("${path.module}/network_config.cfg", {
+    ip_address = var.vm_ips[count.index]
+    gateway    = var.gateway
+    nameserver = var.nameserver
+  })
 
   meta_data = <<-EOF
-    instance-id: ${var.vm_name}
-    local-hostname: ${var.vm_name}
+    instance-id: ${var.vm_name}-${count.index}
+    local-hostname: ${var.vm_name}-${count.index}
   EOF
 }
 
 resource "libvirt_domain" "vm" {
+  count      = var.vm_count
   depends_on = [null_resource.resize_disk]
 
-  name   = var.vm_name
+  name   = "${var.vm_name}-${count.index}"
   type   = "kvm"
   memory = var.memory_mb
   vcpu   = var.vcpu_count
 
-  cloudinit = libvirt_cloudinit_disk.cloudinit.id
+  cloudinit = libvirt_cloudinit_disk.cloudinit[count.index].id
 
   disk {
-    volume_id = libvirt_volume.vm_disk.id
+    volume_id = libvirt_volume.vm_disk[count.index].id
   }
 
   # Keep NIC, but DO NOT wait for DHCP lease (prevents terraform timeout)

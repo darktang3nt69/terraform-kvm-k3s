@@ -10,10 +10,16 @@ variable "pool_name" {
   description = "Libvirt storage pool name"
 }
 
+variable "vm_count" {
+  type        = number
+  default     = 2
+  description = "Number of VMs to provision"
+}
+
 variable "vm_name" {
   type        = string
-  default     = "tf-kvm-test-1"
-  description = "VM name"
+  default     = "k3s-node"
+  description = "Base name for the VMs"
 }
 
 variable "memory_mb" {
@@ -69,9 +75,27 @@ variable "vm_password" {
   sensitive   = true
 }
 
-# Networking (ignored for IP retrieval — we won't wait for DHCP)
+# Networking
 variable "libvirt_network_name" {
   type        = string
-  default     = "default"
-  description = "Libvirt network name (can be broken/inactive; we won't wait for lease)"
+  default     = "br0"
+  description = "Libvirt network name"
+}
+
+variable "vm_ips" {
+  type        = list(string)
+  default     = ["192.168.1.16", "192.168.1.17"]
+  description = "List of static IPs for the VMs"
+}
+
+variable "gateway" {
+  type        = string
+  default     = "192.168.1.1"
+  description = "Default gateway"
+}
+
+variable "nameserver" {
+  type        = string
+  default     = "1.1.1.1"
+  description = "DNS nameserver"
 }
